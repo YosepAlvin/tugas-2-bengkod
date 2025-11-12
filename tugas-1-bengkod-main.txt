@@ -1,0 +1,690 @@
+﻿<?php
+/**
+* Poliklinik - One File (RAPI)
+* - PDO + prepared statements
+* - Auto create DB + tables + sample data
+* - Roles: admin, dokter, apoteker, pasien
+* - CRUD pasien, obat
+* - Resep oleh dokter (status: pending)
+* - Dispense oleh apoteker (status -> dispensed, stok dikurangi) (transaction)
+*
+* Usage:
+* 1. letakkan file di htdocs/
+* 2. buka di browser: http://localhost/poliklinik_onefile.php
+* 3. default accounts:
+* admin / admin
+* dokter1 / dokter
+* apoteker1 / apoteker
+* pasien1 / pasien
+*/
+
+session_start();
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+
+// ---------- CONFIG ----------
+$dbHost = '127.0.0.1';
+$dbUser = 'root';
+$dbPass = '';        // sesuaikan jika perlu
+$dbName = 'poliklinik_onefile';
+
+// ---------- HELPERS: DB connect + init ----------
+function pdo_connect($host, $user, $pass, $dbname = null) {
+$dsn = $dbname ? "mysql:host={$host};dbname={$dbname};charset=utf8mb4" : "mysql:host={$host};charset=utf8mb4";
+$opt = [
+PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+];
+return new PDO($dsn, $user, $pass, $opt);
+}
+
+try {
+// connect without db to create if not exists
+$tmp = pdo_connect($dbHost, $dbUser, $dbPass);
+$tmp->exec("CREATE DATABASE IF NOT EXISTS `{$dbName}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+// reconnect to db
+$pdo = pdo_connect($dbHost, $dbUser, $dbPass, $dbName);
+} catch (Exception $e) {
+die("Koneksi DB gagal: " . htmlspecialchars($e->getMessage()));
+}
+
+// ---------- INIT TABLES ----------
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS users (
+id INT AUTO_INCREMENT PRIMARY KEY,
+username VARCHAR(100) UNIQUE NOT NULL,
+password VARCHAR(255) NOT NULL,
+role ENUM('admin','dokter','apoteker','pasien') NOT NULL,
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+");
+
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS pasien (
+id INT AUTO_INCREMENT PRIMARY KEY,
+nama VARCHAR(150) NOT NULL,
+alamat TEXT,
+no_hp VARCHAR(30),
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+");
+
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS obat (
+id INT AUTO_INCREMENT PRIMARY KEY,
+nama VARCHAR(150) NOT NULL,
+stok INT DEFAULT 0,
+harga DECIMAL(12,2) DEFAULT 0,
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+");
+
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS prescriptions (
+id INT AUTO_INCREMENT PRIMARY KEY,
+pasien_id INT,
+dokter_username VARCHAR(100),
+notes TEXT,
+status ENUM('pending','dispensed','rejected') DEFAULT 'pending',
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+FOREIGN KEY (pasien_id) REFERENCES pasien(id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+");
+
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS prescription_items (
+id INT AUTO_INCREMENT PRIMARY KEY,
+prescription_id INT,
+obat_id INT,
+qty INT DEFAULT 1,
+instructions TEXT,
+FOREIGN KEY (prescription_id) REFERENCES prescriptions(id) ON DELETE CASCADE,
+FOREIGN KEY (obat_id) REFERENCES obat(id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+");
+
+// ---------- SAMPLE DATA ----------
+$count = $pdo->query("SELECT COUNT(*) AS c FROM users")->fetch()['c'];
+if ($count == 0) {
+$ins = $pdo->prepare("INSERT INTO users (username,password,role) VALUES (?, ?, ?)");
+$ins->execute(['admin', password_hash('admin', PASSWORD_DEFAULT), 'admin']);
+$ins->execute(['dokter1', password_hash('dokter', PASSWORD_DEFAULT), 'dokter']);
+$ins->execute(['apoteker1', password_hash('apoteker', PASSWORD_DEFAULT), 'apoteker']);
+$ins->execute(['pasien1', password_hash('pasien', PASSWORD_DEFAULT), 'pasien']);
+}
+
+$c = $pdo->query("SELECT COUNT(*) c FROM pasien")->fetch()['c'];
+if ($c == 0) {
+$pdo->exec("INSERT INTO pasien (nama, alamat, no_hp) VALUES
+('Budi Santoso','Jl. Mawar No.1','081234567890'),
+('Siti Aminah','Jl. Melati No.2','082345678901')
+");
+}
+
+$c = $pdo->query("SELECT COUNT(*) c FROM obat")->fetch()['c'];
+if ($c == 0) {
+$pdo->exec("INSERT INTO obat (nama, stok, harga) VALUES
+('Paracetamol', 100, 2000.00),
+('Amoxicillin', 50, 5000.00),
+('Vitamin C', 200, 1500.00)
+");
+}
+
+// ---------- AUTH HANDLERS ----------
+$flash = function($msg){ echo '<p style="color:green">'.$msg.'</p>'; };
+
+// login
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['act']) && $_POST['act'] === 'login') {
+$u = trim($_POST['username'] ?? '');
+$p = $_POST['password'] ?? '';
+if ($u === '' || $p === '') {
+$err = "Username dan password harus diisi.";
+} else {
+$stmt = $pdo->prepare("SELECT * FROM users WHERE username = ?");
+$stmt->execute([$u]);
+$user = $stmt->fetch();
+if ($user && password_verify($p, $user['password'])) {
+// sukses
+$_SESSION['user'] = ['id'=>$user['id'],'username'=>$user['username'],'role'=>$user['role']];
+header("Location: ?page=home");
+exit;
+} else {
+$err = "Login gagal â cek username/password.";
+}
+}
+}
+
+// logout
+if (isset($_GET['action']) && $_GET['action'] === 'logout') {
+session_unset();
+session_destroy();
+header("Location: ?");
+exit;
+}
+
+// helper: require role
+function require_role($roles = []) {
+if (!isset($_SESSION['user'])) {
+header("Location: ?");
+exit;
+}
+if (!in_array($_SESSION['user']['role'], (array)$roles)) {
+die("<p>Akses ditolak. Role dibutuhkan: ".implode(',', (array)$roles)."</p><p><a href='?page=home'>Kembali</a></p>");
+}
+}
+
+// sanitize output
+function e($s){ return htmlspecialchars($s ?? '', ENT_QUOTES, 'UTF-8'); }
+
+// ---------- ROUTING ----------
+$page = $_GET['page'] ?? 'login';
+
+// ---------- ACTIONS: pasien CRUD ----------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'pasien_add') {
+require_role(['admin','dokter']);
+$nama = trim($_POST['nama'] ?? '');
+$alamat = trim($_POST['alamat'] ?? '');
+$no_hp = trim($_POST['no_hp'] ?? '');
+if ($nama !== '') {
+$stmt = $pdo->prepare("INSERT INTO pasien (nama, alamat, no_hp) VALUES (?, ?, ?)");
+$stmt->execute([$nama, $alamat, $no_hp]);
+header("Location: ?page=pasien&msg=added");
+exit;
+} else {
+$err = "Nama pasien wajib diisi.";
+}
+}
+if (isset($_GET['del_pasien'])) {
+require_role(['admin','dokter']);
+$id = (int)$_GET['del_pasien'];
+$pdo->prepare("DELETE FROM pasien WHERE id = ?")->execute([$id]);
+header("Location: ?page=pasien&msg=deleted");
+exit;
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'pasien_edit') {
+require_role(['admin','dokter']);
+$id = (int)($_POST['id'] ?? 0);
+$nama = trim($_POST['nama'] ?? '');
+$alamat = trim($_POST['alamat'] ?? '');
+$no_hp = trim($_POST['no_hp'] ?? '');
+if ($id > 0 && $nama !== '') {
+$pdo->prepare("UPDATE pasien SET nama=?, alamat=?, no_hp=? WHERE id=?")->execute([$nama,$alamat,$no_hp,$id]);
+header("Location: ?page=pasien&msg=updated");
+exit;
+} else {
+$err = "Gagal update pasien.";
+}
+}
+
+// ---------- ACTIONS: obat CRUD ----------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'obat_add') {
+require_role(['admin','apoteker']);
+$nama = trim($_POST['nama'] ?? '');
+$stok = (int)($_POST['stok'] ?? 0);
+$harga = (float)($_POST['harga'] ?? 0);
+if ($nama !== '') {
+$pdo->prepare("INSERT INTO obat (nama, stok, harga) VALUES (?,?,?)")->execute([$nama,$stok,$harga]);
+header("Location: ?page=obat&msg=added");
+exit;
+} else { $err = "Nama obat wajib."; }
+}
+if (isset($_GET['del_obat'])) {
+require_role(['admin','apoteker']);
+$id = (int)$_GET['del_obat'];
+$pdo->prepare("DELETE FROM obat WHERE id = ?")->execute([$id]);
+header("Location: ?page=obat&msg=deleted");
+exit;
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'obat_edit') {
+require_role(['admin','apoteker']);
+$id = (int)($_POST['id'] ?? 0);
+$nama = trim($_POST['nama'] ?? '');
+$stok = (int)($_POST['stok'] ?? 0);
+$harga = (float)($_POST['harga'] ?? 0);
+if ($id>0 && $nama!=='') {
+$pdo->prepare("UPDATE obat SET nama=?, stok=?, harga=? WHERE id=?")->execute([$nama,$stok,$harga,$id]);
+header("Location: ?page=obat&msg=updated");
+exit;
+} else { $err = "Gagal update obat."; }
+}
+
+// ---------- ACTIONS: prescriptions ----------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'presc_add') {
+require_role(['dokter']);
+$pasien_id = (int)($_POST['pasien_id'] ?? 0);
+$notes = trim($_POST['notes'] ?? '');
+$items = $_POST['items'] ?? []; // array of ['obat_id'=>..,'qty'=>..,'instr'=>..]
+if ($pasien_id <= 0 || empty($items)) {
+$err = "Pasien dan setidaknya 1 obat harus diisi.";
+} else {
+$pdo->beginTransaction();
+try {
+$stmt = $pdo->prepare("INSERT INTO prescriptions (pasien_id, dokter_username, notes) VALUES (?, ?, ?)");
+$stmt->execute([$pasien_id, $_SESSION['user']['username'], $notes]);
+$presc_id = $pdo->lastInsertId();
+$insItem = $pdo->prepare("INSERT INTO prescription_items (prescription_id, obat_id, qty, instructions) VALUES (?, ?, ?, ?)");
+foreach ($items as $it) {
+$oid = (int)($it['obat_id'] ?? 0);
+$qty = (int)($it['qty'] ?? 1);
+$instr = trim($it['instr'] ?? '');
+if ($oid > 0 && $qty > 0) {
+$insItem->execute([$presc_id, $oid, $qty, $instr]);
+}
+}
+$pdo->commit();
+header("Location: ?page=prescriptions&msg=added");
+exit;
+} catch (Exception $e) {
+$pdo->rollBack();
+$err = "Gagal menyimpan resep: " . $e->getMessage();
+}
+}
+}
+
+// pharmacist: dispense prescription (reduce stock)
+if (isset($_GET['dispense'])) {
+require_role(['apoteker']);
+$presc_id = (int)$_GET['dispense'];
+// ambil items
+$items = $pdo->prepare("SELECT pi.*, o.stok, o.nama FROM prescription_items pi JOIN obat o ON pi.obat_id=o.id WHERE pi.prescription_id = ?");
+$items->execute([$presc_id]);
+$rows = $items->fetchAll();
+if (!$rows) { $err = "Resep tidak ditemukan."; }
+else {
+// check stok
+$ok = true;
+foreach ($rows as $r) {
+if ($r['stok'] < $r['qty']) { $ok = false; $err = "Stok tidak cukup untuk: {$r['nama']} (minta {$r['qty']}, tersedia {$r['stok']})"; break; }
+}
+if ($ok) {
+try {
+$pdo->beginTransaction();
+// kurangi stok
+$upd = $pdo->prepare("UPDATE obat SET stok = stok - ? WHERE id = ?");
+foreach ($rows as $r) {
+$upd->execute([(int)$r['qty'], (int)$r['obat_id']]);
+}
+// update status prescription
+$pdo->prepare("UPDATE prescriptions SET status = 'dispensed' WHERE id = ?")->execute([$presc_id]);
+$pdo->commit();
+header("Location: ?page=prescriptions&msg=dispensed");
+exit;
+} catch (Exception $e) {
+$pdo->rollBack();
+$err = "Gagal dispense: " . $e->getMessage();
+}
+}
+}
+}
+
+// pharmacist reject
+if (isset($_GET['reject'])) {
+require_role(['apoteker']);
+$presc_id = (int)$_GET['reject'];
+$pdo->prepare("UPDATE prescriptions SET status='rejected' WHERE id=?")->execute([$presc_id]);
+header("Location: ?page=prescriptions&msg=rejected");
+exit;
+}
+
+// ---------- UI Rendering ----------
+function topbar() {
+echo '<div style="background:#0d6efd;color:white;padding:10px">';
+echo '<strong>Poliklinik (One File)</strong>';
+if (isset($_SESSION['user'])) {
+echo ' | Logged in as: '.e($_SESSION['user']['username']).' ('.e($_SESSION['user']['role']).') ';
+echo " | <a href='?action=logout' style='color:#fff'>Logout</a>";
+}
+echo '</div><br>';
+}
+
+function menu_for($role) {
+echo '<div style="margin-bottom:10px">';
+echo "<a href='?page=home'>Dashboard</a> | ";
+if (in_array($role, ['admin','dokter'])) echo "<a href='?page=pasien'>Pasien</a> | ";
+if (in_array($role, ['admin','apoteker'])) echo "<a href='?page=obat'>Obat</a> | ";
+if ($role === 'dokter') echo "<a href='?page=prescriptions'>Buat Resep</a> | ";
+if ($role === 'apoteker') echo "<a href='?page=prescriptions'>Kelola Resep</a> | ";
+echo "</div>";
+}
+
+?><!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Poliklinik OneFile</title>
+<style>
+body{font-family:Arial, Helvetica, sans-serif; margin:18px}
+table{border-collapse:collapse;width:100%}
+table th, table td{border:1px solid #ddd;padding:8px}
+.form-inline input{margin-right:6px}
+.card{border:1px solid #ddd;padding:12px;margin-bottom:12px;border-radius:6px}
+.err{color:#b00020}
+.ok{color:green}
+</style>
+</head>
+<body>
+<?php topbar(); ?>
+
+<?php
+// Show messages/errors
+if (isset($_GET['msg'])) {
+$m = $_GET['msg'];
+$map = ['added'=>'Berhasil ditambahkan.','deleted'=>'Berhasil dihapus.','updated'=>'Berhasil diperbarui.','dispensed'=>'Resep telah didispensasi.','rejected'=>'Resep ditolak.'];
+if (isset($map[$m])) echo '<p class="ok">'.e($map[$m]).'</p>';
+}
+if (!empty($err)) echo '<p class="err">'.e($err).'</p>';
+
+// Main pages
+if ($page === 'login' && !isset($_SESSION['user'])): ?>
+<div class="card" style="max-width:480px">
+<h2>Login Poliklinik</h2>
+<form method="post">
+<input type="hidden" name="act" value="login">
+<label>Username</label><br>
+<input type="text" name="username" required><br><br>
+<label>Password</label><br>
+<input type="password" name="password" required><br><br>
+<button type="submit">Login</button>
+</form>
+<p>Sample: admin/admin | dokter1/dokter | apoteker1/apoteker | pasien1/pasien</p>
+</div>
+
+<?php elseif ($page === 'home' && isset($_SESSION['user'])):
+$role = $_SESSION['user']['role'];
+menu_for($role);
+// small dashboard stats
+$tot_pas = $pdo->query("SELECT COUNT(*) c FROM pasien")->fetch()['c'];
+$tot_obat = $pdo->query("SELECT COUNT(*) c FROM obat")->fetch()['c'];
+$tot_presc_pending = $pdo->query("SELECT COUNT(*) c FROM prescriptions WHERE status='pending'")->fetch()['c'];
+?>
+<div class="card">
+<h2>Dashboard</h2>
+<p>Selamat datang, <strong><?= e($_SESSION['user']['username']) ?></strong> (<?= e($role) ?>)</p>
+<ul>
+<li>Total pasien: <?= $tot_pas ?></li>
+<li>Total obat: <?= $tot_obat ?></li>
+<li>Resep pending: <?= $tot_presc_pending ?></li>
+</ul>
+</div>
+
+<?php elseif ($page === 'pasien' && isset($_SESSION['user'])):
+require_role(['admin','dokter']);
+menu_for($_SESSION['user']['role']);
+// fetch
+$rows = $pdo->query("SELECT * FROM pasien ORDER BY id DESC")->fetchAll();
+?>
+<div class="card">
+<h3>Data Pasien</h3>
+<table>
+<tr><th>ID</th><th>Nama</th><th>Alamat</th><th>No HP</th><th>Aksi</th></tr>
+<?php foreach ($rows as $r): ?>
+<tr>
+<td><?= $r['id'] ?></td>
+<td><?= e($r['nama']) ?></td>
+<td><?= e($r['alamat']) ?></td>
+<td><?= e($r['no_hp']) ?></td>
+<td>
+<a href="?page=pasien_edit&id=<?= $r['id'] ?>">Edit</a> |
+<a href="?page=pasien&del_pasien=<?= $r['id'] ?>" onclick="return confirm('Hapus pasien?')">Hapus</a>
+</td>
+</tr>
+<?php endforeach; ?>
+</table>
+<h4>Tambah Pasien</h4>
+<form method="post">
+<input type="hidden" name="action" value="pasien_add">
+Nama: <input type="text" name="nama" required>
+No HP: <input type="text" name="no_hp">
+<br><br>
+Alamat: <br><textarea name="alamat" rows="3" style="width:60%"></textarea><br><br>
+<button type="submit">Tambah</button>
+</form>
+</div>
+
+<?php elseif ($page === 'pasien_edit' && isset($_SESSION['user'])):
+require_role(['admin','dokter']);
+$id = (int)($_GET['id'] ?? 0);
+$row = $pdo->prepare("SELECT * FROM pasien WHERE id = ?"); $row->execute([$id]); $r = $row->fetch();
+if (!$r) { echo '<p>Pasien tidak ditemukan.</p>'; }
+else {
+menu_for($_SESSION['user']['role']);
+?>
+<div class="card">
+<h3>Edit Pasien</h3>
+<form method="post">
+<input type="hidden" name="action" value="pasien_edit">
+<input type="hidden" name="id" value="<?= $r['id'] ?>">
+Nama: <input type="text" name="nama" value="<?= e($r['nama']) ?>" required><br><br>
+No HP: <input type="text" name="no_hp" value="<?= e($r['no_hp']) ?>"><br><br>
+Alamat: <br><textarea name="alamat" rows="4" style="width:60%"><?= e($r['alamat']) ?></textarea><br><br>
+<button type="submit">Simpan</button>
+</form>
+</div>
+<?php } ?>
+
+<?php elseif ($page === 'obat' && isset($_SESSION['user'])):
+require_role(['admin','apoteker']);
+menu_for($_SESSION['user']['role']);
+$rows = $pdo->query("SELECT * FROM obat ORDER BY id DESC")->fetchAll();
+?>
+<div class="card">
+<h3>Data Obat</h3>
+<table>
+<tr><th>ID</th><th>Nama</th><th>Stok</th><th>Harga</th><th>Aksi</th></tr>
+<?php foreach ($rows as $r): ?>
+<tr>
+<td><?= $r['id'] ?></td>
+<td><?= e($r['nama']) ?></td>
+<td><?= $r['stok'] ?></td>
+<td><?= number_format($r['harga'],2) ?></td>
+<td>
+<a href="?page=obat_edit&id=<?= $r['id'] ?>">Edit</a> |
+<a href="?page=obat&del_obat=<?= $r['id'] ?>" onclick="return confirm('Hapus obat?')">Hapus</a>
+</td>
+</tr>
+<?php endforeach; ?>
+</table>
+
+<h4>Tambah Obat</h4>
+<form method="post" class="form-inline">
+<input type="hidden" name="action" value="obat_add">
+Nama: <input type="text" name="nama" required>
+Stok: <input type="number" name="stok" value="0" style="width:80px">
+Harga: <input type="text" name="harga" value="0" style="width:100px">
+<button type="submit">Tambah</button>
+</form>
+</div>
+
+<?php elseif ($page === 'obat_edit' && isset($_SESSION['user'])):
+require_role(['admin','apoteker']);
+$id = (int)($_GET['id'] ?? 0);
+$row = $pdo->prepare("SELECT * FROM obat WHERE id = ?"); $row->execute([$id]); $r = $row->fetch();
+if (!$r) echo '<p>Obat tidak ditemukan.</p>';
+else {
+menu_for($_SESSION['user']['role']);
+?>
+<div class="card">
+<h3>Edit Obat</h3>
+<form method="post">
+<input type="hidden" name="action" value="obat_edit">
+<input type="hidden" name="id" value="<?= $r['id'] ?>">
+Nama: <input type="text" name="nama" value="<?= e($r['nama']) ?>" required><br><br>
+Stok: <input type="number" name="stok" value="<?= $r['stok'] ?>"><br><br>
+Harga: <input type="text" name="harga" value="<?= $r['harga'] ?>"><br><br>
+<button type="submit">Simpan</button>
+</form>
+</div>
+<?php } ?>
+
+<?php elseif ($page === 'prescriptions' && isset($_SESSION['user'])):
+$role = $_SESSION['user']['role'];
+menu_for($role);
+if ($role === 'dokter'):
+// form buat resep
+$pasienList = $pdo->query("SELECT id,nama FROM pasien")->fetchAll();
+$obats = $pdo->query("SELECT id,nama,stok FROM obat")->fetchAll();
+?>
+<div class="card">
+<h3>Buat Resep (Dokter)</h3>
+<form method="post" id="prescForm">
+<input type="hidden" name="action" value="presc_add">
+Pilih Pasien:
+<select name="pasien_id" required>
+<?php foreach($pasienList as $p) echo "<option value='{$p['id']}'>".e($p['nama'])."</option>"; ?>
+</select>
+<br><br>
+Catatan dokter:<br>
+<textarea name="notes" rows="3" style="width:60%"></textarea>
+<h4>Obat (tambahkan beberapa)</h4>
+<div id="items">
+<div class="item">
+<select name="items[0][obat_id]">
+<?php foreach($obats as $o) echo "<option value='{$o['id']}'>".e($o['nama'])." (stok: {$o['stok']})</option>"; ?>
+</select>
+Qty: <input type="number" name="items[0][qty]" value="1" style="width:70px">
+Instr: <input type="text" name="items[0][instr]" style="width:220px">
+</div>
+</div>
+<br>
+<button type="button" onclick="addItem()">Tambah Obat</button>
+<button type="submit">Simpan Resep</button>
+</form>
+<script>
+let idx = 1;
+function addItem(){
+const tpl = document.querySelector('.item').outerHTML;
+let html = tpl.replace(/\[0\]/g, '['+idx+']');
+document.getElementById('items').insertAdjacentHTML('beforeend', html);
+idx++;
+}
+</script>
+</div>
+
+<div class="card">
+<h3>Riwayat Resep (semua)</h3>
+<table>
+<tr><th>ID</th><th>Pasien</th><th>Dokter</th><th>Status</th><th>Tanggal</th><th>Aksi</th></tr>
+<?php
+$list = $pdo->query("SELECT pr.*, p.nama as pasien FROM prescriptions pr LEFT JOIN pasien p ON pr.pasien_id=p.id ORDER BY pr.id DESC")->fetchAll();
+foreach($list as $row):
+?>
+<tr>
+<td><?= $row['id'] ?></td>
+<td><?= e($row['pasien']) ?></td>
+<td><?= e($row['dokter_username']) ?></td>
+<td><?= e($row['status']) ?></td>
+<td><?= $row['created_at'] ?></td>
+<td><a href="?page=prescription_view&id=<?= $row['id'] ?>">Lihat</a></td>
+</tr>
+<?php endforeach; ?>
+</table>
+</div>
+
+<?php elseif ($role === 'apoteker'):
+// apoteker lihat pending & dispense
+$pending = $pdo->query("SELECT pr.*, p.nama as pasien FROM prescriptions pr LEFT JOIN pasien p ON pr.pasien_id=p.id WHERE pr.status='pending' ORDER BY pr.id DESC")->fetchAll();
+$all = $pdo->query("SELECT pr.*, p.nama as pasien FROM prescriptions pr LEFT JOIN pasien p ON pr.pasien_id=p.id ORDER BY pr.id DESC")->fetchAll();
+?>
+<div class="card">
+<h3>Resep Pending</h3>
+<table>
+<tr><th>ID</th><th>Pasien</th><th>Dokter</th><th>Tanggal</th><th>Aksi</th></tr>
+<?php foreach($pending as $pr): ?>
+<tr>
+<td><?= $pr['id'] ?></td>
+<td><?= e($pr['pasien']) ?></td>
+<td><?= e($pr['dokter_username']) ?></td>
+<td><?= $pr['created_at'] ?></td>
+<td>
+<a href="?page=prescription_view&id=<?= $pr['id'] ?>">Lihat</a> |
+<a href="?dispense=<?= $pr['id'] ?>" onclick="return confirm('Dispense resep ini?')">Dispense</a> |
+<a href="?reject=<?= $pr['id'] ?>" onclick="return confirm('Tolak resep?')">Tolak</a>
+</td>
+</tr>
+<?php endforeach; ?>
+</table>
+</div>
+
+<div class="card">
+<h3>Semua Resep</h3>
+<table>
+<tr><th>ID</th><th>Pasien</th><th>Dokter</th><th>Status</th><th>Tanggal</th><th>Aksi</th></tr>
+<?php foreach($all as $pr): ?>
+<tr>
+<td><?= $pr['id'] ?></td>
+<td><?= e($pr['pasien']) ?></td>
+<td><?= e($pr['dokter_username']) ?></td>
+<td><?= e($pr['status']) ?></td>
+<td><?= $pr['created_at'] ?></td>
+<td><a href="?page=prescription_view&id=<?= $pr['id'] ?>">Lihat</a></td>
+</tr>
+<?php endforeach; ?>
+</table>
+</div>
+
+<?php elseif ($role === 'pasien'):
+// pasien lihat resep sendiri
+$stmt = $pdo->prepare("SELECT pr.*, u.username as dokter FROM prescriptions pr LEFT JOIN users u ON pr.dokter_username = u.username WHERE pr.pasien_id = ? ORDER BY pr.id DESC");
+$stmt->execute([ /* pasien id -> find by username mapping */ ]);
+// Need to map pasien user to pasien table â for demo, we show all prescriptions that match pasien name if available.
+// Simpler: show all for now (or filter by pasien table if user created mapping).
+$list = $pdo->query("SELECT pr.*, p.nama as pasien FROM prescriptions pr LEFT JOIN pasien p ON pr.pasien_id=p.id WHERE p.nama IS NOT NULL ORDER BY pr.id DESC")->fetchAll();
+?>
+<div class="card">
+<h3>Riwayat Resep (Pasien)</h3>
+<table>
+<tr><th>ID</th><th>Pasien</th><th>Dokter</th><th>Status</th><th>Tanggal</th><th>Aksi</th></tr>
+<?php foreach($list as $row): ?>
+<tr>
+<td><?= $row['id'] ?></td>
+<td><?= e($row['pasien']) ?></td>
+<td><?= e($row['dokter_username']) ?></td>
+<td><?= e($row['status']) ?></td>
+<td><?= $row['created_at'] ?></td>
+<td><a href="?page=prescription_view&id=<?= $row['id'] ?>">Lihat</a></td>
+</tr>
+<?php endforeach; ?>
+</table>
+</div>
+<?php endif; ?>
+
+<?php elseif ($page === 'prescription_view' && isset($_SESSION['user'])):
+$id = (int)($_GET['id'] ?? 0);
+$pres = $pdo->prepare("SELECT pr.*, p.nama as pasien FROM prescriptions pr LEFT JOIN pasien p ON pr.pasien_id=p.id WHERE pr.id = ?");
+$pres->execute([$id]); $pr = $pres->fetch();
+if (!$pr) echo "<p>Resep tidak ditemukan.</p>";
+else {
+menu_for($_SESSION['user']['role']);
+$items = $pdo->prepare("SELECT pi.*, o.nama as obat FROM prescription_items pi LEFT JOIN obat o ON pi.obat_id=o.id WHERE pi.prescription_id = ?");
+$items->execute([$id]); $it = $items->fetchAll();
+?>
+<div class="card">
+<h3>Resep #<?= $pr['id'] ?></h3>
+<p>Pasien: <?= e($pr['pasien']) ?></p>
+<p>Dokter: <?= e($pr['dokter_username']) ?></p>
+<p>Status: <?= e($pr['status']) ?></p>
+<p>Catatan: <?= e($pr['notes']) ?></p>
+<h4>Item</h4>
+<table>
+<tr><th>Obat</th><th>Qty</th><th>Instruksi</th></tr>
+<?php foreach($it as $row): ?>
+<tr>
+<td><?= e($row['obat']) ?></td>
+<td><?= (int)$row['qty'] ?></td>
+<td><?= e($row['instructions']) ?></td>
+</tr>
+<?php endforeach; ?>
+</table>
+</div>
+<?php } ?>
+
+<?php else:
+// default: if logged -> redirect to home; else show login
+if (isset($_SESSION['user'])) header("Location: ?page=home");
+else header("Location: ?page=login");
+exit;
+endif;
+?>
+
+</body>
+</html>
